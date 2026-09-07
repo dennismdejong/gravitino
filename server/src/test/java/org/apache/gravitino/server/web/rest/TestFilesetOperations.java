@@ -244,6 +244,17 @@ public class TestFilesetOperations extends BaseOperationsTest {
   }
 
   @Test
+  public void testCreateFilesetWithNullRequest() {
+    Response resp =
+        target(filesetPath(metalake, catalog, schema))
+            .request(MediaType.APPLICATION_JSON_TYPE)
+            .accept("application/vnd.gravitino.v1+json")
+            .post(Entity.entity(new byte[0], MediaType.APPLICATION_JSON_TYPE));
+
+    assertNullRequestBodyRejected(resp);
+  }
+
+  @Test
   public void testCreateFileset() {
     Fileset fileset =
         mockFileset(
@@ -252,7 +263,7 @@ public class TestFilesetOperations extends BaseOperationsTest {
             "mock comment",
             "mock location",
             ImmutableMap.of("k1", "v1"));
-    when(dispatcher.createMultipleLocationFileset(any(), any(), any(), any(), any()))
+    when(dispatcher.createMultipleLocationFileset(any(), any(), any(), any(), any(), any(), any()))
         .thenReturn(fileset);
 
     FilesetCreateRequest req =
@@ -299,7 +310,7 @@ public class TestFilesetOperations extends BaseOperationsTest {
             "mock comment",
             locations,
             ImmutableMap.of("k1", "v1"));
-    when(dispatcher.createMultipleLocationFileset(any(), any(), any(), any(), any()))
+    when(dispatcher.createMultipleLocationFileset(any(), any(), any(), any(), any(), any(), any()))
         .thenReturn(fileset);
 
     req =
@@ -331,7 +342,7 @@ public class TestFilesetOperations extends BaseOperationsTest {
     // Test throw NoSuchSchemaException
     doThrow(new NoSuchSchemaException("mock error"))
         .when(dispatcher)
-        .createMultipleLocationFileset(any(), any(), any(), any(), any());
+        .createMultipleLocationFileset(any(), any(), any(), any(), any(), any(), any());
 
     Response resp1 =
         target(filesetPath(metalake, catalog, schema))
@@ -348,7 +359,7 @@ public class TestFilesetOperations extends BaseOperationsTest {
     // Test throw FilesetAlreadyExistsException
     doThrow(new FilesetAlreadyExistsException("mock error"))
         .when(dispatcher)
-        .createMultipleLocationFileset(any(), any(), any(), any(), any());
+        .createMultipleLocationFileset(any(), any(), any(), any(), any(), any(), any());
 
     Response resp2 =
         target(filesetPath(metalake, catalog, schema))
@@ -366,7 +377,7 @@ public class TestFilesetOperations extends BaseOperationsTest {
     // Test throw RuntimeException
     doThrow(new RuntimeException("mock error"))
         .when(dispatcher)
-        .createMultipleLocationFileset(any(), any(), any(), any(), any());
+        .createMultipleLocationFileset(any(), any(), any(), any(), any(), any(), any());
 
     Response resp3 =
         target(filesetPath(metalake, catalog, schema))
@@ -384,7 +395,7 @@ public class TestFilesetOperations extends BaseOperationsTest {
     // Test throw Error
     doThrow(new Error("mock error"))
         .when(dispatcher)
-        .createMultipleLocationFileset(any(), any(), any(), any(), any());
+        .createMultipleLocationFileset(any(), any(), any(), any(), any(), any(), any());
     Response resp4 =
         target(filesetPath(metalake, catalog, schema))
             .request(MediaType.APPLICATION_JSON_TYPE)
@@ -395,6 +406,17 @@ public class TestFilesetOperations extends BaseOperationsTest {
     ErrorResponse errorResp4 = resp4.readEntity(ErrorResponse.class);
     Assertions.assertEquals(ErrorConstants.INTERNAL_ERROR_CODE, errorResp4.getCode());
     Assertions.assertEquals(RuntimeException.class.getSimpleName(), errorResp4.getType());
+  }
+
+  @Test
+  public void testAlterFilesetWithNullRequest() {
+    Response resp =
+        target(filesetPath(metalake, catalog, schema) + "fileset1")
+            .request(MediaType.APPLICATION_JSON_TYPE)
+            .accept("application/vnd.gravitino.v1+json")
+            .put(Entity.entity(new byte[0], MediaType.APPLICATION_JSON_TYPE));
+
+    assertNullRequestBodyRejected(resp);
   }
 
   @Test

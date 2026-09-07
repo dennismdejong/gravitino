@@ -17,9 +17,11 @@
 
 import asyncio
 import logging
+import re
 from collections import OrderedDict
 
 from mcp_server.client.factory import RESTClientFactory
+from mcp_server.core.oauth import RefreshableBearerAuth
 from mcp_server.core.setting import Setting
 
 _LOG = logging.getLogger(__name__)
@@ -30,6 +32,39 @@ _LOG = logging.getLogger(__name__)
 # per tool call, while the LRU bound keeps memory/sockets in check as principals
 # (e.g. rotating tokens) come and go.
 _MAX_CACHED_CLIENTS = 128
+
+# An RFC 9110 auth-scheme uses the HTTP token syntax. Here it must be followed by
+# one or more spaces plus credentials. Requiring credentials preserves the legacy
+# behavior for a bare token whose value happens to be a scheme name (for example,
+# Bearer).
+_AUTHORIZATION_CREDENTIAL = re.compile(
+    r"^(?P<scheme>[!#$%&'*+\-.^_`|~0-9A-Za-z]+) +(?P<credential>\S.*)$"
+)
+
+# Gravitino currently matches its built-in schemes case-sensitively. HTTP scheme
+# names are case-insensitive, so normalize them before forwarding. Custom scheme
+# names remain unchanged for custom Gravitino authenticators.
+_CANONICAL_AUTH_SCHEMES = {
+    "basic": "Basic",
+    "bearer": "Bearer",
+    "negotiate": "Negotiate",
+}
+
+
+class ServiceIdentityFallbackDisabled(RuntimeError):
+    """HTTP omitted Authorization while service-identity fallback is disabled."""
+
+
+def _in_http_request() -> bool:
+    """Return True when ``rest_client()`` runs inside an active HTTP request."""
+    try:
+        # pylint: disable=import-outside-toplevel
+        from fastmcp.server.dependencies import get_http_request
+
+        get_http_request()
+        return True
+    except (LookupError, RuntimeError):
+        return False
 
 
 def _get_request_authorization() -> str:
@@ -55,11 +90,59 @@ def _get_request_authorization() -> str:
 def startup_authorization(setting: Setting) -> str:
     """The static --token rendered as an ``Authorization`` header value.
 
-    The CLI token is treated as an OAuth2 Bearer token. Empty string when no
-    token is configured (anonymous). This is the identity used in stdio mode and
-    the fallback for HTTP requests that carry no ``Authorization`` header.
+    A value containing a valid HTTP authentication scheme and credentials is
+    forwarded as an Authorization credential. Built-in Gravitino scheme names
+    are normalized to the capitalization its authenticators expect, while a
+    custom scheme name is preserved. A bare token is treated as OAuth2 and
+    prefixed with ``Bearer``. Empty string when no token is configured
+    (anonymous). This is the identity used in stdio mode and the fallback for
+    HTTP requests that carry no ``Authorization`` header.
     """
-    return f"Bearer {setting.token}" if setting.token else ""
+    token = setting.token.strip()
+    if not token:
+        return ""
+    match = _AUTHORIZATION_CREDENTIAL.fullmatch(token)
+    if match:
+        scheme = match.group("scheme")
+        credential = match.group("credential")
+        canonical_scheme = _CANONICAL_AUTH_SCHEMES.get(scheme.lower(), scheme)
+        return f"{canonical_scheme} {credential}"
+    return f"Bearer {token}"
+
+
+def service_fallback_authorization(setting: Setting) -> str:
+    """Audit / fallback identity when no hop-1 Authorization header is present.
+
+    Prefers the static ``--token``. When only OAuth client-credentials is
+    configured, returns ``OAuth <client_id>`` so audit logs can attribute
+    stdio / no-header calls to the service client.
+    """
+    static = startup_authorization(setting)
+    if static:
+        return static
+    if setting.has_oauth_client():
+        return f"OAuth {setting.oauth_client_id.strip()}"
+    return ""
+
+
+def _service_auth(setting: Setting):
+    """httpx ``auth=`` hook for service OAuth, or None for static/anonymous."""
+    setting.validate_oauth()
+    static = startup_authorization(setting)
+    if static:
+        if setting.has_oauth_client():
+            _LOG.warning(
+                "Ignoring OAuth client credentials because --token is set"
+            )
+        return None
+    if not setting.has_oauth_client():
+        return None
+    return RefreshableBearerAuth(
+        token_endpoint=setting.oauth_token_endpoint.strip(),
+        client_id=setting.oauth_client_id.strip(),
+        client_secret=setting.oauth_client_secret.strip(),
+        scope=setting.oauth_scope.strip(),
+    )
 
 
 class GravitinoContext:
@@ -69,6 +152,7 @@ class GravitinoContext:
             setting.metalake,
             setting.gravitino_uri,
             startup_authorization(setting),
+            auth=_service_auth(setting),
         )
         # LRU cache of per-principal clients keyed by the raw Authorization header.
         # Safe without locking: rest_client() runs on the single asyncio event
@@ -87,7 +171,8 @@ class GravitinoContext:
         token. This keeps concurrent sessions with different principals fully
         isolated — one principal's identity never leaks into another's calls.
 
-        Falls back to the shared default client (static startup token) when:
+        Falls back to the shared default client (static token or OAuth
+        client-credentials) when:
         - running in stdio mode (no HTTP request context), or
         - the incoming request carries no Authorization header.
 
@@ -96,6 +181,15 @@ class GravitinoContext:
         """
         authorization = _get_request_authorization()
         if not authorization:
+            if (
+                self._setting.no_service_identity_fallback
+                and _in_http_request()
+                and self._setting.has_service_identity()
+            ):
+                raise ServiceIdentityFallbackDisabled(
+                    "HTTP request omitted Authorization and "
+                    "--no-service-identity-fallback is set"
+                )
             return self._default_client
 
         cached = self._clients_by_auth.get(authorization)

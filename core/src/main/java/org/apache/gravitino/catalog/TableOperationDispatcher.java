@@ -33,6 +33,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -45,10 +46,13 @@ import org.apache.gravitino.NameIdentifier;
 import org.apache.gravitino.Namespace;
 import org.apache.gravitino.StringIdentifier;
 import org.apache.gravitino.connector.HasPropertyMetadata;
+import org.apache.gravitino.connector.MaskAndOmitKeys;
 import org.apache.gravitino.connector.capability.Capability;
+import org.apache.gravitino.exceptions.GravitinoRuntimeException;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.exceptions.NoSuchSchemaException;
 import org.apache.gravitino.exceptions.NoSuchTableException;
+import org.apache.gravitino.exceptions.OptimisticLockException;
 import org.apache.gravitino.exceptions.TableAlreadyExistsException;
 import org.apache.gravitino.lock.LockType;
 import org.apache.gravitino.lock.TreeLockUtils;
@@ -64,6 +68,7 @@ import org.apache.gravitino.rel.expressions.sorts.SortOrder;
 import org.apache.gravitino.rel.expressions.transforms.Transform;
 import org.apache.gravitino.rel.indexes.Index;
 import org.apache.gravitino.rel.indexes.Indexes;
+import org.apache.gravitino.secret.SecretManager;
 import org.apache.gravitino.storage.IdGenerator;
 import org.apache.gravitino.utils.NamespaceUtil;
 import org.apache.gravitino.utils.PrincipalUtils;
@@ -82,10 +87,19 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
    * @param catalogManager The CatalogManager instance to be used for table operations.
    * @param store The EntityStore instance to be used for table operations.
    * @param idGenerator The IdGenerator instance to be used for table operations.
+   * @param secretManager The SecretManager instance to be used for secret operations.
    */
   public TableOperationDispatcher(
-      CatalogManager catalogManager, EntityStore store, IdGenerator idGenerator) {
-    this(catalogManager, store, idGenerator, () -> GravitinoEnv.getInstance().schemaDispatcher());
+      CatalogManager catalogManager,
+      EntityStore store,
+      IdGenerator idGenerator,
+      SecretManager secretManager) {
+    this(
+        catalogManager,
+        store,
+        idGenerator,
+        () -> GravitinoEnv.getInstance().internalSchemaDispatcher(),
+        secretManager);
   }
 
   /**
@@ -95,13 +109,15 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
    * @param store The EntityStore instance to be used for table operations.
    * @param idGenerator The IdGenerator instance to be used for table operations.
    * @param schemaDispatcherSupplier The SchemaDispatcher supplier to ensure schemas are imported.
+   * @param secretManager The SecretManager instance to be used for secret operations.
    */
   public TableOperationDispatcher(
       CatalogManager catalogManager,
       EntityStore store,
       IdGenerator idGenerator,
-      Supplier<SchemaDispatcher> schemaDispatcherSupplier) {
-    super(catalogManager, store, idGenerator);
+      Supplier<SchemaDispatcher> schemaDispatcherSupplier,
+      SecretManager secretManager) {
+    super(catalogManager, store, idGenerator, secretManager);
     this.schemaDispatcherSupplier =
         Preconditions.checkNotNull(
             schemaDispatcherSupplier, "schemaDispatcherSupplier must not be null");
@@ -169,11 +185,7 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
     TableEntity updatedEntity = updateColumnsIfNecessaryWhenLoad(ident, entityCombinedTable);
 
     return EntityCombinedTable.of(entityCombinedTable.tableFromCatalog(), updatedEntity)
-        .withHiddenProperties(
-            getHiddenPropertyNames(
-                getCatalogIdentifier(ident),
-                HasPropertyMetadata::tablePropertiesMetadata,
-                entityCombinedTable.tableFromCatalog().properties()))
+        .withHiddenProperties(entityCombinedTable.hiddenProperties())
         .withImported(entityCombinedTable.imported());
   }
 
@@ -231,11 +243,14 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
    * @return The altered {@link Table} object after applying the changes.
    * @throws NoSuchTableException If the table to alter does not exist.
    * @throws IllegalArgumentException If an unsupported or invalid change is specified.
+   * @throws GravitinoRuntimeException If a rename succeeds in the external catalog but Gravitino
+   *     cannot update the stored table registration consistently.
    */
   @Override
   public Table alterTable(NameIdentifier ident, TableChange... changes)
       throws NoSuchTableException, IllegalArgumentException {
-    validateAlterProperties(ident, HasPropertyMetadata::tablePropertiesMetadata, changes);
+    boolean isRenameTable =
+        Arrays.stream(changes).anyMatch(change -> change instanceof TableChange.RenameTable);
 
     // use the read lock on the table if there does not exist TableChange.RenameTable in the
     // changes, or:
@@ -264,37 +279,44 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
         nameIdentifierForLock.equals(ident) ? LockType.READ : LockType.WRITE,
         () -> {
           NameIdentifier catalogIdent = getCatalogIdentifier(ident);
-          Table alteredTable =
+          AlterTableCatalogResult catalogResult =
               doWithCatalog(
                   catalogIdent,
-                  c ->
-                      c.doWithTableOps(
-                          t -> t.alterTable(ident, applyCapabilities(c.capabilities(), changes))),
+                  catalog -> {
+                    validateAlterProperties(
+                        catalog, HasPropertyMetadata::tablePropertiesMetadata, changes);
+                    boolean managed = isManagedEntity(catalog, Capability.Scope.TABLE);
+                    Optional<TableEntity> tableEntityBeforeRename =
+                        isRenameTable && !managed
+                            ? getTableEntityBeforeRename(ident)
+                            : Optional.empty();
+                    Table table =
+                        catalog.doWithTableOps(
+                            tableOps ->
+                                tableOps.alterTable(
+                                    ident, applyCapabilities(catalog.capabilities(), changes)));
+                    return new AlterTableCatalogResult(
+                        snapshotTable(catalog, table, managed), tableEntityBeforeRename);
+                  },
                   NoSuchTableException.class,
                   IllegalArgumentException.class);
+          Table alteredTable = catalogResult.table;
 
-          boolean isManagedTable = isManagedEntity(catalogIdent, Capability.Scope.TABLE);
-          if (isManagedTable) {
+          if (catalogResult.managed) {
             return EntityCombinedTable.of(alteredTable)
-                .withHiddenProperties(
-                    getHiddenPropertyNames(
-                        getCatalogIdentifier(ident),
-                        HasPropertyMetadata::tablePropertiesMetadata,
-                        alteredTable.properties()));
+                .withHiddenProperties(catalogResult.hiddenProperties);
           }
 
           StringIdentifier stringId = getStringIdFromProperties(alteredTable.properties());
           // Case 1: The table is not created by Gravitino and this table is never imported.
-          TableEntity te = null;
+          TableEntity te = catalogResult.tableEntityBeforeRename.orElse(null);
           if (stringId == null) {
-            te = getEntity(ident, TABLE, TableEntity.class);
+            if (te == null) {
+              te = getEntity(ident, TABLE, TableEntity.class);
+            }
             if (te == null) {
               return EntityCombinedTable.of(alteredTable)
-                  .withHiddenProperties(
-                      getHiddenPropertyNames(
-                          getCatalogIdentifier(ident),
-                          HasPropertyMetadata::tablePropertiesMetadata,
-                          alteredTable.properties()));
+                  .withHiddenProperties(catalogResult.hiddenProperties);
             }
           }
 
@@ -338,12 +360,19 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
                   "UPDATE",
                   tableId);
 
+          // operateOnEntity returns null if the store update fails or if the returned entity ID
+          // does not match the ID from the external catalog.
+          if (isRenameTable && updatedTableEntity == null) {
+            NameIdentifier newIdent =
+                NameIdentifier.of(getNewNamespace(ident, changes), alteredTable.name());
+            throw new GravitinoRuntimeException(
+                "Table %s was renamed to %s in the external catalog, but its registration in "
+                    + "Gravitino could not be updated consistently",
+                ident, newIdent);
+          }
+
           return EntityCombinedTable.of(alteredTable, updatedTableEntity)
-              .withHiddenProperties(
-                  getHiddenPropertyNames(
-                      getCatalogIdentifier(ident),
-                      HasPropertyMetadata::tablePropertiesMetadata,
-                      alteredTable.properties()));
+              .withHiddenProperties(catalogResult.hiddenProperties);
         });
   }
 
@@ -374,20 +403,20 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
             return droppedFromCatalog;
           }
 
-          // For unmanaged table, it could happen that the table:
-          // 1. Is not found in the catalog (dropped directly from underlying sources)
-          // 2. Is found in the catalog but not in the store (not managed by Gravitino)
-          // 3. Is found in the catalog and the store (managed by Gravitino)
-          // 4. Neither found in the catalog nor in the store.
-          // In all situations, we try to delete the table from the store, but we don't take the
-          // return value of the store operation into account. We only take the return value of the
-          // catalog into account.
-          try {
-            store.delete(ident, TABLE);
-          } catch (NoSuchEntityException e) {
-            LOG.warn("The table to be dropped does not exist in the store: {}", ident, e);
-          } catch (Exception e) {
-            throw new RuntimeException(e);
+          // A false result is ambiguous: the external table may have been renamed or dropped out of
+          // band. Preserve the registration because deleting it after a rename would lose
+          // Gravitino-only metadata. A true out-of-band drop can therefore leave a stale
+          // registration that requires separate cleanup.
+          if (droppedFromCatalog) {
+            try {
+              store.delete(ident, TABLE);
+            } catch (OptimisticLockException e) {
+              throw e;
+            } catch (NoSuchEntityException e) {
+              LOG.warn("The table to be dropped does not exist in the store: {}", ident, e);
+            } catch (Exception e) {
+              throw new RuntimeException(e);
+            }
           }
           // Run unconditionally: an out-of-band drop may have left orphaned schema entities. The
           // cleanup is best-effort and stops as soon as a schema still exists.
@@ -430,21 +459,20 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
             return droppedFromCatalog;
           }
 
-          // For unmanaged table, it could happen that the table:
-          // 1. Is not found in the catalog (dropped directly from underlying sources)
-          // 2. Is found in the catalog but not in the store (not managed by Gravitino)
-          // 3. Is found in the catalog and the store (managed by Gravitino)
-          // 4. Neither found in the catalog nor in the store.
-          // In all situations, we try to delete the table from the store, but we don't take the
-          // return value of the store operation into account. We only take the return value of the
-          // catalog into account.
-          try {
-            store.delete(ident, TABLE);
-          } catch (NoSuchEntityException e) {
-            LOG.warn("The table to be purged does not exist in the store: {}", ident, e);
-            return false;
-          } catch (Exception e) {
-            throw new RuntimeException(e);
+          // A false result is ambiguous: the external table may have been renamed or dropped out of
+          // band. Preserve the registration because deleting it after a rename would lose
+          // Gravitino-only metadata. A true out-of-band purge can therefore leave a stale
+          // registration that requires separate cleanup.
+          if (droppedFromCatalog) {
+            try {
+              store.delete(ident, TABLE);
+            } catch (OptimisticLockException e) {
+              throw e;
+            } catch (NoSuchEntityException e) {
+              LOG.warn("The table to be purged does not exist in the store: {}", ident, e);
+            } catch (Exception e) {
+              throw new RuntimeException(e);
+            }
           }
           // Run unconditionally: an out-of-band purge may have left orphaned schema entities. The
           // cleanup is best-effort and stops as soon as a schema still exists.
@@ -469,6 +497,17 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
                     ((TableChange.RenameTable) c).getNewSchemaName().get()))
         .reduce((c1, c2) -> c2)
         .orElse(tableIdent.namespace());
+  }
+
+  private Optional<TableEntity> getTableEntityBeforeRename(NameIdentifier ident) {
+    try {
+      return Optional.of(store.get(ident, TABLE, TableEntity.class));
+    } catch (NoSuchEntityException e) {
+      return Optional.empty();
+    } catch (Exception e) {
+      throw new GravitinoRuntimeException(
+          e, "Failed to read the stored registration for table %s before renaming it", ident);
+    }
   }
 
   private EntityCombinedTable importTable(NameIdentifier identifier) {
@@ -527,11 +566,7 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
     }
 
     return EntityCombinedTable.of(table.tableFromCatalog(), tableEntity)
-        .withHiddenProperties(
-            getHiddenPropertyNames(
-                getCatalogIdentifier(identifier),
-                HasPropertyMetadata::tablePropertiesMetadata,
-                table.tableFromCatalog().properties()));
+        .withHiddenProperties(table.hiddenProperties());
   }
 
   private SchemaDispatcher getSchemaDispatcher() {
@@ -545,20 +580,19 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
 
   private EntityCombinedTable internalLoadTable(NameIdentifier ident) {
     NameIdentifier catalogIdentifier = getCatalogIdentifier(ident);
-    Table table =
+    TableCatalogResult catalogResult =
         doWithCatalog(
             catalogIdentifier,
-            c -> c.doWithTableOps(t -> t.loadTable(ident)),
+            catalog -> {
+              Table table = catalog.doWithTableOps(tableOps -> tableOps.loadTable(ident));
+              return snapshotTable(catalog, table);
+            },
             NoSuchTableException.class);
+    Table table = catalogResult.table;
 
-    boolean isManagedTable = isManagedEntity(catalogIdentifier, Capability.Scope.TABLE);
-    if (isManagedTable) {
+    if (catalogResult.managed) {
       return EntityCombinedTable.of(table)
-          .withHiddenProperties(
-              getHiddenPropertyNames(
-                  catalogIdentifier,
-                  HasPropertyMetadata::tablePropertiesMetadata,
-                  table.properties()))
+          .withHiddenProperties(catalogResult.hiddenProperties)
           // The metadata of managed table is stored by Gravitino, so it is always imported.
           .withImported(true /* imported */);
     }
@@ -570,11 +604,7 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
       TableEntity tableEntity = getEntity(ident, TABLE, TableEntity.class);
       if (tableEntity == null) {
         return EntityCombinedTable.of(table)
-            .withHiddenProperties(
-                getHiddenPropertyNames(
-                    catalogIdentifier,
-                    HasPropertyMetadata::tablePropertiesMetadata,
-                    table.properties()))
+            .withHiddenProperties(catalogResult.hiddenProperties)
             // Some tables don't have properties or are not created by Gravitino,
             // we can't use stringIdentifier to judge whether schema is ever imported or not.
             // We need to check whether the entity exists.
@@ -582,11 +612,7 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
       }
 
       return EntityCombinedTable.of(table, tableEntity)
-          .withHiddenProperties(
-              getHiddenPropertyNames(
-                  catalogIdentifier,
-                  HasPropertyMetadata::tablePropertiesMetadata,
-                  table.properties()))
+          .withHiddenProperties(catalogResult.hiddenProperties)
           // For some catalogs like PG, the identifier information is not stored in the table's
           // metadata, we need to check if this table exists in the store, if so we don't
           // need to import.
@@ -601,11 +627,7 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
             stringId.id());
 
     return EntityCombinedTable.of(table, tableEntity)
-        .withHiddenProperties(
-            getHiddenPropertyNames(
-                catalogIdentifier,
-                HasPropertyMetadata::tablePropertiesMetadata,
-                table.properties()))
+        .withHiddenProperties(catalogResult.hiddenProperties)
         .withImported(tableEntity != null);
   }
 
@@ -619,51 +641,47 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
       SortOrder[] sortOrders,
       Index[] indexes) {
     NameIdentifier catalogIdent = getCatalogIdentifier(ident);
-    doWithCatalog(
-        catalogIdent,
-        c ->
-            c.doWithPropertiesMeta(
-                p -> {
-                  validatePropertyForCreate(p.tablePropertiesMetadata(), properties);
-                  return null;
-                }),
-        IllegalArgumentException.class);
-
-    long uid = idGenerator.nextId();
-    // Add StringIdentifier to the properties, the specific catalog will handle this
-    // StringIdentifier to make sure only when the operation is successful, the related
-    // TableEntity will be visible.
-    StringIdentifier stringId = StringIdentifier.fromId(uid);
-    Map<String, String> updatedProperties =
-        StringIdentifier.newPropertiesWithId(stringId, properties);
-
-    // we do not retrieve the table again (to obtain some values generated by underlying catalog)
-    // since some catalogs' API is async and the table may not be created immediately
-    Table table =
+    CreateTableCatalogResult catalogResult =
         doWithCatalog(
             catalogIdent,
-            c ->
-                c.doWithTableOps(
-                    t ->
-                        t.createTable(
-                            ident,
-                            columns,
-                            comment,
-                            updatedProperties,
-                            partitions == null ? EMPTY_TRANSFORM : partitions,
-                            distribution == null ? Distributions.NONE : distribution,
-                            sortOrders == null ? new SortOrder[0] : sortOrders,
-                            indexes == null ? Indexes.EMPTY_INDEXES : indexes)),
+            catalog -> {
+              catalog.doWithPropertiesMeta(
+                  metadata -> {
+                    validatePropertyForCreate(metadata.tablePropertiesMetadata(), properties);
+                    return null;
+                  });
+
+              long uid = idGenerator.nextId();
+              // Add StringIdentifier to the properties, the specific catalog will handle this
+              // StringIdentifier to make sure only when the operation is successful, the related
+              // TableEntity will be visible.
+              StringIdentifier stringId = StringIdentifier.fromId(uid);
+              Map<String, String> updatedProperties =
+                  StringIdentifier.newPropertiesWithId(stringId, properties);
+
+              // We do not retrieve the table again to obtain values generated by the underlying
+              // catalog because some catalog APIs are asynchronous.
+              Table table =
+                  catalog.doWithTableOps(
+                      tableOps ->
+                          tableOps.createTable(
+                              ident,
+                              columns,
+                              comment,
+                              updatedProperties,
+                              partitions == null ? EMPTY_TRANSFORM : partitions,
+                              distribution == null ? Distributions.NONE : distribution,
+                              sortOrders == null ? new SortOrder[0] : sortOrders,
+                              indexes == null ? Indexes.EMPTY_INDEXES : indexes));
+              return new CreateTableCatalogResult(snapshotTable(catalog, table), uid);
+            },
             NoSuchSchemaException.class,
             TableAlreadyExistsException.class);
+    Table table = catalogResult.table;
 
     // If the table is managed by Gravitino, we don't need to create TableEntity and store it again.
-    boolean isManagedTable = isManagedEntity(catalogIdent, Capability.Scope.TABLE);
-    if (isManagedTable) {
-      return EntityCombinedTable.of(table)
-          .withHiddenProperties(
-              getHiddenPropertyNames(
-                  catalogIdent, HasPropertyMetadata::tablePropertiesMetadata, table.properties()));
+    if (catalogResult.managed) {
+      return EntityCombinedTable.of(table).withHiddenProperties(catalogResult.hiddenProperties);
     }
 
     AuditInfo audit =
@@ -678,7 +696,7 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
 
     TableEntity tableEntity =
         TableEntity.builder()
-            .withId(uid)
+            .withId(catalogResult.id)
             .withName(ident.name())
             .withNamespace(ident.namespace())
             .withColumns(columnEntityList)
@@ -689,17 +707,26 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
       store.put(tableEntity, true /* overwrite */);
     } catch (Exception e) {
       LOG.error(FormattedErrorMessages.STORE_OP_FAILURE, "put", ident, e);
-      return EntityCombinedTable.of(table)
-          .withHiddenProperties(
-              getHiddenPropertyNames(
-                  catalogIdent, HasPropertyMetadata::tablePropertiesMetadata, table.properties()));
+      return EntityCombinedTable.of(table).withHiddenProperties(catalogResult.hiddenProperties);
     }
 
     // Merge both the metadata from catalog operation and the metadata from entity store.
     return EntityCombinedTable.of(table, tableEntity)
-        .withHiddenProperties(
-            getHiddenPropertyNames(
-                catalogIdent, HasPropertyMetadata::tablePropertiesMetadata, table.properties()));
+        .withHiddenProperties(catalogResult.hiddenProperties);
+  }
+
+  private TableCatalogResult snapshotTable(
+      CatalogManager.CatalogWrapper catalog, Table table, boolean managed) throws Exception {
+    Table snapshot = catalog.detachConnectorResult(table);
+    MaskAndOmitKeys hiddenProperties =
+        getMaskAndOmitKeys(
+            catalog, HasPropertyMetadata::tablePropertiesMetadata, snapshot.properties());
+    return new TableCatalogResult(snapshot, managed, hiddenProperties);
+  }
+
+  private TableCatalogResult snapshotTable(CatalogManager.CatalogWrapper catalog, Table table)
+      throws Exception {
+    return snapshotTable(catalog, table, isManagedEntity(catalog, Capability.Scope.TABLE));
   }
 
   private List<ColumnEntity> toColumnEntities(Column[] columns, AuditInfo audit) {
@@ -904,5 +931,39 @@ public class TableOperationDispatcher extends OperationDispatcher implements Tab
                                 .build()),
                 "UPDATE",
                 combinedTable.tableFromGravitino().id()));
+  }
+
+  private static class TableCatalogResult {
+
+    final Table table;
+    final boolean managed;
+    final MaskAndOmitKeys hiddenProperties;
+
+    private TableCatalogResult(Table table, boolean managed, MaskAndOmitKeys hiddenProperties) {
+      this.table = table;
+      this.managed = managed;
+      this.hiddenProperties = hiddenProperties;
+    }
+  }
+
+  private static final class AlterTableCatalogResult extends TableCatalogResult {
+
+    private final Optional<TableEntity> tableEntityBeforeRename;
+
+    private AlterTableCatalogResult(
+        TableCatalogResult tableResult, Optional<TableEntity> tableEntityBeforeRename) {
+      super(tableResult.table, tableResult.managed, tableResult.hiddenProperties);
+      this.tableEntityBeforeRename = tableEntityBeforeRename;
+    }
+  }
+
+  private static final class CreateTableCatalogResult extends TableCatalogResult {
+
+    private final long id;
+
+    private CreateTableCatalogResult(TableCatalogResult tableResult, long id) {
+      super(tableResult.table, tableResult.managed, tableResult.hiddenProperties);
+      this.id = id;
+    }
   }
 }

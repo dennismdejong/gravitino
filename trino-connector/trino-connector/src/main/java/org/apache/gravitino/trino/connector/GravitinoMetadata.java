@@ -24,6 +24,7 @@ import static org.apache.gravitino.trino.connector.GravitinoErrorCode.GRAVITINO_
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.AggregateFunction;
@@ -58,15 +59,19 @@ import io.trino.spi.connector.SystemTable;
 import io.trino.spi.connector.TopNApplicationResult;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
+import io.trino.spi.expression.Variable;
 import io.trino.spi.function.LanguageFunction;
 import io.trino.spi.function.SchemaFunctionName;
 import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.statistics.ColumnStatistics;
 import io.trino.spi.statistics.TableStatistics;
 import io.trino.spi.type.Type;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -85,8 +90,6 @@ import org.apache.gravitino.trino.connector.catalog.CatalogConnectorMetadata;
 import org.apache.gravitino.trino.connector.catalog.CatalogConnectorMetadataAdapter;
 import org.apache.gravitino.trino.connector.metadata.GravitinoSchema;
 import org.apache.gravitino.trino.connector.metadata.GravitinoTable;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * The GravitinoMetadata class provides operations for Apache Gravitino metadata on the Gravitino
@@ -95,7 +98,7 @@ import org.slf4j.LoggerFactory;
  */
 public abstract class GravitinoMetadata implements ConnectorMetadata {
 
-  private static final Logger LOG = LoggerFactory.getLogger(GravitinoMetadata.class);
+  private static final Logger LOG = Logger.get(GravitinoMetadata.class);
 
   // The column handle name that will generate row IDs for the merge operation.
   public static final String MERGE_ROW_ID = "$row_id";
@@ -285,7 +288,7 @@ public abstract class GravitinoMetadata implements ConnectorMetadata {
       try {
         catalogConnectorMetadata.dropTable(tableName);
       } catch (Exception dropException) {
-        LOG.warn("Failed to drop table {} during CTAS cleanup", tableName, dropException);
+        LOG.warn(dropException, "Failed to drop table %s during CTAS cleanup", tableName);
       }
       throw e;
     }
@@ -310,7 +313,7 @@ public abstract class GravitinoMetadata implements ConnectorMetadata {
       // (e.g., Hive 'format' is a String in Gravitino but HiveStorageFormat enum internally).
       // Returning empty is correct for non-bucketed CTAS.
       LOG.debug(
-          "Skipping internal getNewTableLayout due to property type mismatch: {}", e.getMessage());
+          "Skipping internal getNewTableLayout due to property type mismatch: %s", e.getMessage());
       return Optional.empty();
     }
   }
@@ -503,37 +506,47 @@ public abstract class GravitinoMetadata implements ConnectorMetadata {
       ConnectorTableHandle handle,
       List<ConnectorExpression> projections,
       Map<String, ColumnHandle> assignments) {
+    Map<String, ColumnHandle> internalAssignments =
+        assignments.entrySet().stream()
+            .collect(
+                Collectors.toMap(
+                    Map.Entry::getKey, entry -> GravitinoHandle.unWrap(entry.getValue())));
+    // The engine variable name for each column handle passed in, the reverse of
+    // internalAssignments. Used below to find the engine variable a returned assignment refers
+    // to even if the internal connector renamed it (e.g. to avoid a name collision), since the
+    // same underlying column handle is preserved either way.
+    Map<ColumnHandle, String> engineVariableByColumn =
+        internalAssignments.entrySet().stream()
+            .collect(
+                Collectors.toMap(Map.Entry::getValue, Map.Entry::getKey, (first, second) -> first));
+    SchemaTableName tableName = getTableName(handle);
     return internalMetadata
-        .applyProjection(
-            session,
-            GravitinoHandle.unWrap(handle),
-            projections,
-            assignments.entrySet().stream()
-                .collect(
-                    Collectors.toMap(
-                        Map.Entry::getKey, entry -> GravitinoHandle.unWrap(entry.getValue()))))
+        .applyProjection(session, GravitinoHandle.unWrap(handle), projections, internalAssignments)
         .map(
-            result ->
-                new ProjectionApplicationResult<>(
-                    new GravitinoTableHandle(
-                        getTableName(handle).getSchemaName(),
-                        getTableName(handle).getTableName(),
-                        result.getHandle()),
-                    result.getProjections(),
-                    result.getAssignments().stream()
-                        .map(
-                            entry ->
-                                new Assignment(
-                                    entry.getVariable(),
-                                    new GravitinoColumnHandle(
-                                        getColumnName(
-                                            session,
-                                            GravitinoHandle.unWrap(handle),
-                                            entry.getColumn()),
-                                        entry.getColumn()),
-                                    entry.getType()))
-                        .toList(),
-                    result.isPrecalculateStatistics()));
+            result -> {
+              // Restore the types the engine assigned to the projected variables; see
+              // resolveAssignmentType for why this is needed.
+              Map<String, Type> engineTypes = collectVariableTypes(projections);
+              return new ProjectionApplicationResult<>(
+                  new GravitinoTableHandle(
+                      tableName.getSchemaName(), tableName.getTableName(), result.getHandle()),
+                  result.getProjections(),
+                  result.getAssignments().stream()
+                      .map(
+                          entry ->
+                              new Assignment(
+                                  entry.getVariable(),
+                                  new GravitinoColumnHandle(
+                                      getColumnName(
+                                          session,
+                                          GravitinoHandle.unWrap(handle),
+                                          entry.getColumn()),
+                                      entry.getColumn()),
+                                  resolveAssignmentType(
+                                      entry, engineTypes, engineVariableByColumn)))
+                      .toList(),
+                  result.isPrecalculateStatistics());
+            });
   }
 
   @Override
@@ -858,7 +871,7 @@ public abstract class GravitinoMetadata implements ConnectorMetadata {
       }
       return toLanguageFunctions(function);
     } catch (NoSuchFunctionException e) {
-      LOG.debug("Function {} not found in schema {}", name.getFunctionName(), name.getSchemaName());
+      LOG.debug("Function %s not found in schema %s", name.getFunctionName(), name.getSchemaName());
       return List.of();
     }
   }
@@ -881,7 +894,7 @@ public abstract class GravitinoMetadata implements ConnectorMetadata {
           String signatureToken = buildSignatureToken(function.name(), definition.parameters());
           result.add(new LanguageFunction(signatureToken, sql, List.of(), Optional.empty()));
         } catch (TrinoException e) {
-          LOG.warn("Failed to build signature token for function {}", function.name(), e);
+          LOG.warn(e, "Failed to build signature token for function %s", function.name());
         }
       }
     }
@@ -909,5 +922,46 @@ public abstract class GravitinoMetadata implements ConnectorMetadata {
     }
     sb.append(")");
     return sb.toString();
+  }
+
+  /**
+   * Resolves the type for an assignment returned by the internal connector. The internal connector
+   * may type an assignment from its own column handle, which can disagree with the type this
+   * connector declared for the same column, for example an unbounded varchar here and a
+   * varchar(65535) there for MySQL tinytext. Since Trino 444, a plan whose symbol and expression
+   * types differ is rejected, so the engine type is applied instead - looked up via the column
+   * handle rather than the assignment's variable name, since the internal connector may have
+   * renamed the variable (e.g. to avoid a name collision) while keeping the same underlying column.
+   * Columns the internal connector synthesized, which have no entry in {@code
+   * engineVariableByColumn}, keep their internal types.
+   *
+   * @param assignment the assignment returned by the internal connector
+   * @param engineTypes the types the engine assigned to the projected variables, by variable name
+   * @param engineVariableByColumn the engine variable name for each column handle the engine passed
+   *     in
+   * @return the type the returned assignment must carry
+   */
+  private static Type resolveAssignmentType(
+      Assignment assignment,
+      Map<String, Type> engineTypes,
+      Map<ColumnHandle, String> engineVariableByColumn) {
+    String engineVariable = engineVariableByColumn.get(assignment.getColumn());
+    if (engineVariable == null) {
+      return assignment.getType();
+    }
+    return engineTypes.getOrDefault(engineVariable, assignment.getType());
+  }
+
+  private static Map<String, Type> collectVariableTypes(List<ConnectorExpression> expressions) {
+    Map<String, Type> types = new HashMap<>();
+    Deque<ConnectorExpression> pending = new ArrayDeque<>(expressions);
+    while (!pending.isEmpty()) {
+      ConnectorExpression expression = pending.pop();
+      if (expression instanceof Variable) {
+        types.put(((Variable) expression).getName(), expression.getType());
+      }
+      pending.addAll(expression.getChildren());
+    }
+    return types;
   }
 }

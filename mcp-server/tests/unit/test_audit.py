@@ -123,10 +123,29 @@ class TestExtractPrincipal(unittest.TestCase):
             audit._extract_principal("Basic not-valid-base64!!"), "anonymous"
         )
 
-    def test_unknown_scheme_returns_anonymous(self):
+    def test_other_scheme_falls_back_to_scheme_prefix(self):
+        """A non-Basic scheme stays attributable via '<scheme>:<first-8>'."""
         self.assertEqual(
-            audit._extract_principal("Negotiate abc123"), "anonymous"
+            audit._extract_principal("Negotiate abc123"), "negotiate:abc123"
         )
+
+    def test_custom_scheme_with_multi_word_credential(self):
+        """A credential containing spaces is not treated as unparsable."""
+        self.assertEqual(
+            audit._extract_principal("Custom-Scheme key=abcdefghij, sig=xy"),
+            "custom-scheme:key=abcd",
+        )
+
+    def test_extra_space_between_scheme_and_credential(self):
+        """Repeated separators do not break Basic decoding."""
+        self.assertEqual(
+            audit._extract_principal("Basic   YWxpY2U6ZHVtbXk="), "alice"
+        )
+
+    def test_scheme_without_credential_returns_anonymous(self):
+        """A scheme with no credential has no identity to report."""
+        self.assertEqual(audit._extract_principal("Bearer"), "anonymous")
+        self.assertEqual(audit._extract_principal("Bearer   "), "anonymous")
 
 
 class TestAuditMiddlewareIntegration(unittest.TestCase):
@@ -183,6 +202,27 @@ class TestAuditMiddlewareIntegration(unittest.TestCase):
 
         record = json.loads(self.log_records[0])
         self.assertEqual(record["principal"], "bearer:abcdef12")
+
+    def test_principal_falls_back_to_oauth_client_id(self):
+        """With no request header, OAuth client-credentials is attributable."""
+        RESTClientFactory.set_rest_client(MockOperation)
+        server = GravitinoMCPServer(
+            Setting(
+                "mock_metalake",
+                oauth_token_endpoint="https://idp/token",
+                oauth_client_id="mcp-service",
+                oauth_client_secret="s",
+            )
+        )
+
+        async def _run():
+            async with Client(server.mcp) as client:
+                await client.call_tool("get_list_of_catalogs")
+
+        asyncio.run(_run())
+
+        record = json.loads(self.log_records[0])
+        self.assertEqual(record["principal"], "oauth:mcp-serv")
 
     def test_failed_tool_call_emits_deny_record(self):
         """A tool call that raises an exception produces an audit record with outcome=deny."""

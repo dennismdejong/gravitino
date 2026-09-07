@@ -39,6 +39,7 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.Response;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.gravitino.Entity;
 import org.apache.gravitino.MetadataObject;
 import org.apache.gravitino.dto.requests.TagCreateRequest;
@@ -73,6 +74,8 @@ import org.slf4j.LoggerFactory;
 public class TagOperations {
 
   private static final Logger LOG = LoggerFactory.getLogger(TagOperations.class);
+
+  private static final int MAX_TAG_VALUE_LENGTH = 256;
 
   private final TagDispatcher tagDispatcher;
 
@@ -148,6 +151,16 @@ public class TagOperations {
       @PathParam("metalake") @AuthorizationMetadata(type = Entity.EntityType.METALAKE)
           String metalake,
       TagCreateRequest request) {
+    if (request == null) {
+      LOG.warn("Received create tag request with null request body");
+      return ExceptionHandlers.handleTagException(
+          OperationType.CREATE,
+          "",
+          metalake,
+          new IllegalArgumentException("Request body cannot be null"));
+    }
+
+    String tagName = request.getName();
     LOG.info("Received create tag request under metalake: {}", metalake);
 
     try {
@@ -157,14 +170,17 @@ public class TagOperations {
             request.validate();
             Tag tag =
                 tagDispatcher.createTag(
-                    metalake, request.getName(), request.getComment(), request.getProperties());
+                    metalake,
+                    request.getName(),
+                    request.getComment(),
+                    request.getProperties(),
+                    request.valueConstraint());
 
             LOG.info("Created tag: {} under metalake: {}", tag.name(), metalake);
             return Utils.ok(new TagResponse(DTOConverters.toDTO(tag, Optional.empty())));
           });
     } catch (Exception e) {
-      return ExceptionHandlers.handleTagException(
-          OperationType.CREATE, request.getName(), metalake, e);
+      return ExceptionHandlers.handleTagException(OperationType.CREATE, tagName, metalake, e);
     }
   }
 
@@ -207,6 +223,13 @@ public class TagOperations {
       @PathParam("tag") @AuthorizationMetadata(type = Entity.EntityType.TAG) String name,
       TagUpdatesRequest request) {
     LOG.info("Received alter tag request for tag: {} under metalake: {}", name, metalake);
+    if (request == null) {
+      return ExceptionHandlers.handleTagException(
+          OperationType.ALTER,
+          name,
+          metalake,
+          new IllegalArgumentException("Request body cannot be null"));
+    }
 
     try {
       return Utils.doAs(
@@ -268,14 +291,21 @@ public class TagOperations {
   public Response listMetadataObjectsForTag(
       @PathParam("metalake") @AuthorizationMetadata(type = Entity.EntityType.METALAKE)
           String metalake,
-      @PathParam("tag") @AuthorizationMetadata(type = Entity.EntityType.TAG) String tagName) {
-    LOG.info("Received list objects for tag: {} under metalake: {}", tagName, metalake);
+      @PathParam("tag") @AuthorizationMetadata(type = Entity.EntityType.TAG) String tagName,
+      @QueryParam("value") String value) {
+    LOG.info(
+        "Received list objects for tag: {} and value: {} under metalake: {}",
+        tagName,
+        value,
+        metalake);
 
     try {
+      validateTagAssignmentValueFilter(value);
       return Utils.doAs(
           httpRequest,
           () -> {
-            MetadataObject[] objects = tagDispatcher.listMetadataObjectsForTag(metalake, tagName);
+            MetadataObject[] objects =
+                tagDispatcher.listMetadataObjectsForTag(metalake, tagName, value);
             objects = objects == null ? new MetadataObject[0] : objects;
 
             LOG.info(
@@ -292,6 +322,21 @@ public class TagOperations {
 
     } catch (Exception e) {
       return ExceptionHandlers.handleTagException(OperationType.LIST, "", tagName, e);
+    }
+  }
+
+  private static void validateTagAssignmentValueFilter(String value) {
+    if (value == null) {
+      return;
+    }
+
+    if (StringUtils.isBlank(value)) {
+      throw new IllegalArgumentException("Tag assignment value must not be null or empty");
+    }
+
+    if (value.length() > MAX_TAG_VALUE_LENGTH) {
+      throw new IllegalArgumentException(
+          "Tag assignment value must not exceed " + MAX_TAG_VALUE_LENGTH + " characters");
     }
   }
 

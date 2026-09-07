@@ -18,6 +18,10 @@
  */
 package org.apache.gravitino.catalog.doris.integration.test;
 
+import static org.apache.gravitino.catalog.doris.DorisTablePropertiesMetadata.BLOOM_FILTER_COLUMNS;
+import static org.apache.gravitino.catalog.doris.DorisTablePropertiesMetadata.COMPRESSION;
+import static org.apache.gravitino.catalog.doris.DorisTablePropertiesMetadata.REPLICATION_ALLOCATION;
+import static org.apache.gravitino.catalog.doris.DorisTablePropertiesMetadata.REPLICATION_FACTOR;
 import static org.apache.gravitino.integration.test.util.ITUtils.assertPartition;
 import static org.apache.gravitino.rel.Column.DEFAULT_VALUE_OF_CURRENT_TIMESTAMP;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -188,6 +192,11 @@ public class CatalogDorisIT extends BaseIT {
     catalog = loadCatalog;
   }
 
+  @Test
+  void testExistingCatalogConnection() {
+    Assertions.assertDoesNotThrow(() -> metalake.testConnection(catalogName));
+  }
+
   private void createSchema() {
     NameIdentifier ident = NameIdentifier.of(metalakeName, catalogName, schemaName);
     String propKey = "key";
@@ -200,6 +209,44 @@ public class CatalogDorisIT extends BaseIT {
     assertEquals(createdSchema.name(), loadSchema.name());
 
     assertEquals(createdSchema.properties().get(propKey), propValue);
+  }
+
+  @Test
+  void testTablePropertiesRoundTrip() {
+    // Verify writable table properties survive the create → Doris 1.2 → load round-trip.
+    // Covers: bloom_filter_columns, compression (both writable).
+    // NOTE: light_schema_change and enable_unique_key_merge_on_write are newer Doris
+    // features (introduced in 2.1+) and do not appear in 1.2.x SHOW CREATE TABLE output.
+    // They are registered as writable properties and their metadata is verified in
+    // TestDorisCatalog.testDorisTablePropertiesMetadata().
+    // storage_policy requires cold-hot separation infrastructure and is covered by
+    // the unit test metadata verification.
+    TableCatalog tc = catalog.asTableCatalog();
+    String tableName = GravitinoITUtils.genRandomName("t_props_roundtrip");
+    NameIdentifier tid = NameIdentifier.of(schemaName, tableName);
+    Column[] columns = createColumns();
+    Distribution distribution = createDistribution();
+
+    Map<String, String> properties = new HashMap<>();
+    properties.put(BLOOM_FILTER_COLUMNS, DORIS_COL_NAME1 + "," + DORIS_COL_NAME2);
+    properties.put(COMPRESSION, "ZSTD");
+
+    tc.createTable(
+        tid, columns, table_comment, properties, Transforms.EMPTY_TRANSFORM, distribution, null);
+
+    Table loaded = tc.loadTable(tid);
+    Map<String, String> loadedProps = loaded.properties();
+
+    // bloom_filter_columns: verify round-trip with Doris normalization
+    assertTrue(
+        loadedProps.containsKey(BLOOM_FILTER_COLUMNS),
+        "bloom_filter_columns should appear in SHOW CREATE TABLE properties");
+    assertEquals(DORIS_COL_NAME1 + ", " + DORIS_COL_NAME2, loadedProps.get(BLOOM_FILTER_COLUMNS));
+
+    // compression: verify round-trip on Doris 1.2.x
+    assertTrue(
+        loadedProps.containsKey(COMPRESSION),
+        "compression should appear in SHOW CREATE TABLE properties on Doris 1.2.x");
   }
 
   private Column[] createColumns() {
@@ -378,6 +425,29 @@ public class CatalogDorisIT extends BaseIT {
         null,
         Transforms.EMPTY_TRANSFORM,
         renamedTable);
+  }
+
+  @Test
+  void testCreateTableWithReplicationAllocation() {
+    NameIdentifier tableIdentifier =
+        NameIdentifier.of(
+            schemaName, GravitinoITUtils.genRandomName("doris_replication_allocation"));
+    String replicationAllocation = "tag.location.default: 1";
+    Map<String, String> properties = ImmutableMap.of(REPLICATION_ALLOCATION, replicationAllocation);
+    TableCatalog tableCatalog = catalog.asTableCatalog();
+
+    tableCatalog.createTable(
+        tableIdentifier,
+        createColumns(),
+        table_comment,
+        properties,
+        Transforms.EMPTY_TRANSFORM,
+        createDistribution(),
+        null);
+
+    Table loadedTable = tableCatalog.loadTable(tableIdentifier);
+    assertEquals(replicationAllocation, loadedTable.properties().get(REPLICATION_ALLOCATION));
+    assertFalse(loadedTable.properties().containsKey(REPLICATION_FACTOR));
   }
 
   @Test

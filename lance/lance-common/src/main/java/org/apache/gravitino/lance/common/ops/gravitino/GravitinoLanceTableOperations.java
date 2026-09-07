@@ -129,7 +129,7 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
 
     Table table;
     try {
-      table = catalog.asTableCatalog().loadTable(tableIdentifier);
+      table = namespaceWrapper.asTableCatalog(catalog).loadTable(tableIdentifier);
     } catch (NoSuchTableException e) {
       throw new TableNotFoundException(
           "Table not found: " + tableId, CommonUtil.formatCurrentStackTrace(), tableId);
@@ -146,7 +146,8 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
             .map(Long::valueOf)
             .orElse(null));
     response.setStorageOptions(
-        LancePropertiesUtils.resolveLanceStorageOptions(catalog.properties(), table.properties()));
+        LancePropertiesUtils.resolveLanceStorageOptions(
+            namespaceWrapper.propsWithSecrets(catalog), table.properties()));
     response.setManagedVersioning(false);
     if (checkDeclared) {
       response.setIsOnlyDeclared(
@@ -194,13 +195,14 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
 
     // Single call - mode is handled server-side
     Table t =
-        catalog
-            .asTableCatalog()
+        namespaceWrapper
+            .asTableCatalog(catalog)
             .createTable(
                 tableIdentifier, columns.toArray(new Column[0]), null, createTableProperties);
     Map<String, String> properties = t.properties();
     Map<String, String> effectiveStorageOptions =
-        LancePropertiesUtils.resolveLanceStorageOptions(catalog.properties(), properties);
+        LancePropertiesUtils.resolveLanceStorageOptions(
+            namespaceWrapper.propsWithSecrets(catalog), properties);
 
     CreateTableResponse response = new CreateTableResponse();
     response.setStorageOptions(effectiveStorageOptions);
@@ -252,8 +254,8 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
 
     // Single call - mode is handled server-side
     Table t =
-        catalog
-            .asTableCatalog()
+        namespaceWrapper
+            .asTableCatalog(catalog)
             .createTable(tableIdentifier, new Column[] {}, null, copiedTableProperties);
 
     RegisterTableResponse response = new RegisterTableResponse();
@@ -275,7 +277,7 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
         NameIdentifier.of(nsId.levelAtListPos(1), nsId.levelAtListPos(2));
     Table t;
     try {
-      t = catalog.asTableCatalog().loadTable(tableIdentifier);
+      t = namespaceWrapper.asTableCatalog(catalog).loadTable(tableIdentifier);
     } catch (NoSuchTableException e) {
       throw new TableNotFoundException(
           "Table not found: " + tableId, CommonUtil.formatCurrentStackTrace(), tableId);
@@ -296,7 +298,7 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
     }
 
     // External tables: dropTable removes catalog metadata only, preserving Lance data.
-    boolean result = catalog.asTableCatalog().dropTable(tableIdentifier);
+    boolean result = namespaceWrapper.asTableCatalog(catalog).dropTable(tableIdentifier);
     if (!result) {
       throw new TableNotFoundException(
           "Table not found: " + tableId, CommonUtil.formatCurrentStackTrace(), tableId);
@@ -321,7 +323,7 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
     NameIdentifier tableIdentifier =
         NameIdentifier.of(nsId.levelAtListPos(1), nsId.levelAtListPos(2));
 
-    return catalog.asTableCatalog().tableExists(tableIdentifier);
+    return namespaceWrapper.asTableCatalog(catalog).tableExists(tableIdentifier);
   }
 
   @Override
@@ -338,13 +340,13 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
 
     Table table;
     try {
-      table = catalog.asTableCatalog().loadTable(tableIdentifier);
+      table = namespaceWrapper.asTableCatalog(catalog).loadTable(tableIdentifier);
     } catch (NoSuchTableException e) {
       throw new TableNotFoundException(
           "Table not found: " + tableId, CommonUtil.formatCurrentStackTrace(), tableId);
     }
 
-    boolean deleted = catalog.asTableCatalog().purgeTable(tableIdentifier);
+    boolean deleted = namespaceWrapper.asTableCatalog(catalog).purgeTable(tableIdentifier);
     if (!deleted) {
       throw new TableNotFoundException(
           "Table not found: " + tableId, CommonUtil.formatCurrentStackTrace(), tableId);
@@ -376,7 +378,7 @@ public class GravitinoLanceTableOperations implements LanceTableOperations {
     }
     TableChange[] changes = handler.buildGravitinoTableChange(request);
 
-    Table table = catalog.asTableCatalog().alterTable(tableIdentifier, changes);
+    Table table = namespaceWrapper.asTableCatalog(catalog).alterTable(tableIdentifier, changes);
 
     return handler.handle(table, request);
   }

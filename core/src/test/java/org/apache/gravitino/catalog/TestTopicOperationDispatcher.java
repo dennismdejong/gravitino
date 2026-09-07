@@ -47,6 +47,7 @@ import org.apache.gravitino.NameIdentifier;
 import org.apache.gravitino.Namespace;
 import org.apache.gravitino.TestCatalog;
 import org.apache.gravitino.auth.AuthConstants;
+import org.apache.gravitino.connector.HiddenPropertyMaskUtils;
 import org.apache.gravitino.connector.TestCatalogOperations;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.lock.LockManager;
@@ -66,9 +67,9 @@ public class TestTopicOperationDispatcher extends TestOperationDispatcher {
   @BeforeAll
   public static void initialize() throws IOException, IllegalAccessException {
     schemaOperationDispatcher =
-        new SchemaOperationDispatcher(catalogManager, entityStore, idGenerator);
+        new SchemaOperationDispatcher(catalogManager, entityStore, idGenerator, secretManager);
     topicOperationDispatcher =
-        new TopicOperationDispatcher(catalogManager, entityStore, idGenerator);
+        new TopicOperationDispatcher(catalogManager, entityStore, idGenerator, secretManager);
 
     Config config = mock(Config.class);
     doReturn(100000L).when(config).get(TREE_LOCK_MAX_NODE_IN_MEMORY);
@@ -265,13 +266,35 @@ public class TestTopicOperationDispatcher extends TestOperationDispatcher {
     NameIdentifier topicIdent = NameIdentifier.of(topicNs, "topic61");
     Map<String, String> props = ImmutableMap.of("k1", "v1", "k2", "v2");
     TestCatalog testCatalog =
-        (TestCatalog) catalogManager.loadCatalog(NameIdentifier.of(metalake, catalog));
+        (TestCatalog)
+            catalogManager.loadCatalogAndWrap(NameIdentifier.of(metalake, catalog)).catalog();
     TestCatalogOperations testCatalogOperations = (TestCatalogOperations) testCatalog.ops();
     testCatalogOperations.createSchema(
         NameIdentifier.of(topicNs.levels()), "", Collections.emptyMap());
     topicOperationDispatcher.createTopic(topicIdent, "comment", null, props);
     Assertions.assertTrue(entityStore.exists(NameIdentifier.of(topicNs.levels()), SCHEMA));
     Assertions.assertTrue(entityStore.exists(topicIdent, Entity.EntityType.TOPIC));
+  }
+
+  @Test
+  public void testCreateAndAlterTopicRejectMaskedPlaceholder() throws IOException {
+    Namespace topicNs = Namespace.of(metalake, catalog, "schema_masked_topic");
+    NameIdentifier topicIdent = NameIdentifier.of(topicNs, "topic_masked");
+    schemaOperationDispatcher.createSchema(
+        NameIdentifier.of(topicNs.levels()), "comment", ImmutableMap.of("k1", "v1", "k2", "v2"));
+
+    Map<String, String> createProps =
+        ImmutableMap.of("k1", HiddenPropertyMaskUtils.MASKED_VALUE, "k2", "v2");
+    testMaskedPlaceholderRejected(
+        () -> topicOperationDispatcher.createTopic(topicIdent, "comment", null, createProps), "k1");
+
+    Map<String, String> props = ImmutableMap.of("k1", "v1", "k2", "v2");
+    topicOperationDispatcher.createTopic(topicIdent, "comment", null, props);
+    testMaskedPlaceholderRejected(
+        () ->
+            topicOperationDispatcher.alterTopic(
+                topicIdent, TopicChange.setProperty("k3", HiddenPropertyMaskUtils.MASKED_VALUE)),
+        "k3");
   }
 
   public static SchemaOperationDispatcher getSchemaOperationDispatcher() {
