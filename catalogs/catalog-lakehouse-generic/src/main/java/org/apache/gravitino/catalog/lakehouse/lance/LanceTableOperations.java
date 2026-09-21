@@ -24,9 +24,11 @@ import static org.apache.gravitino.rel.Column.DEFAULT_VALUE_NOT_SET;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Maps;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -172,8 +174,14 @@ public class LanceTableOperations extends ManagedTableOperations {
    * @param catalogProperties the catalog properties
    */
   public void setCatalogProperties(Map<String, String> catalogProperties) {
+    // A copy that tolerates a null value, not ImmutableMap.copyOf, which throws on one. Nothing
+    // upstream rejects a catalog property whose value is null, and the generic catalog hands this
+    // map on unchanged, so copying it strictly here would fail every table operation on such a
+    // catalog rather than the one property that is null.
     this.catalogProperties =
-        catalogProperties == null ? Map.of() : ImmutableMap.copyOf(catalogProperties);
+        catalogProperties == null
+            ? Map.of()
+            : Collections.unmodifiableMap(Maps.newHashMap(catalogProperties));
   }
 
   @Override
@@ -722,12 +730,36 @@ public class LanceTableOperations extends ManagedTableOperations {
             .withCreator(PrincipalUtils.getCurrentPrincipal().getName())
             .withCreateTime(Instant.now())
             .build();
+    // Tags, owners and privileges are attached to a column by id, so a column that is still in the
+    // dataset keeps its id. It also keeps its comment and audit info, which the dataset doesn't
+    // carry.
+    Map<String, ColumnEntity> existingColumns =
+        tableEntity.columns().stream()
+            .collect(
+                Collectors.toMap(
+                    ColumnEntity::name, Function.identity(), (first, second) -> first));
     List<ColumnEntity> columnEntities =
         IntStream.range(0, columns.length)
             .mapToObj(
-                i ->
-                    ColumnEntity.toColumnEntity(
-                        columns[i], i, idGenerator.nextId(), columnAuditInfo))
+                i -> {
+                  ColumnEntity existing = existingColumns.get(columns[i].name());
+                  if (existing == null) {
+                    return ColumnEntity.toColumnEntity(
+                        columns[i], i, idGenerator.nextId(), columnAuditInfo);
+                  }
+                  return ColumnEntity.builder()
+                      .withId(existing.id())
+                      .withName(columns[i].name())
+                      .withPosition(i)
+                      .withDataType(columns[i].dataType())
+                      .withComment(
+                          columns[i].comment() != null ? columns[i].comment() : existing.comment())
+                      .withNullable(columns[i].nullable())
+                      .withAutoIncrement(columns[i].autoIncrement())
+                      .withDefaultValue(columns[i].defaultValue())
+                      .withAuditInfo((AuditInfo) existing.auditInfo())
+                      .build();
+                })
             .collect(Collectors.toList());
 
     return TableEntity.builder()
@@ -793,7 +825,37 @@ public class LanceTableOperations extends ManagedTableOperations {
         LancePropertiesUtils.resolveLanceStorageOptions(catalogProperties, table.properties());
     try (Dataset dataset = openDataset(location, storageOptions)) {
       for (TableChange change : changes) {
-        if (change instanceof TableChange.DeleteColumn deleteColumn) {
+        if (change instanceof TableChange.AddColumn addColumn) {
+          String[] fieldName = addColumn.fieldName();
+          Preconditions.checkArgument(
+              fieldName.length == 1,
+              "Lance only supports adding top-level columns: %s",
+              String.join(".", fieldName));
+          String columnName = fieldName[0];
+          Preconditions.checkArgument(
+              addColumn.isNullable(),
+              "Lance only supports adding nullable columns because existing rows are backfilled "
+                  + "with null: %s",
+              columnName);
+          Preconditions.checkArgument(
+              TableChange.ColumnPosition.defaultPos().equals(addColumn.getPosition()),
+              "Lance only supports appending new columns: %s",
+              columnName);
+          Preconditions.checkArgument(
+              !addColumn.isAutoIncrement(),
+              "Lance does not support adding auto-increment columns: %s",
+              columnName);
+          Preconditions.checkArgument(
+              addColumn.getDefaultValue() == null
+                  || addColumn.getDefaultValue().equals(DEFAULT_VALUE_NOT_SET),
+              "Lance does not support default values when adding columns: %s",
+              columnName);
+
+          Field field =
+              LanceDataTypeConverter.CONVERTER.toArrowField(
+                  columnName, addColumn.getDataType(), true);
+          dataset.addColumns(List.of(field));
+        } else if (change instanceof TableChange.DeleteColumn deleteColumn) {
           dataset.dropColumns(List.of(String.join(".", deleteColumn.fieldName())));
         } else if (change instanceof TableChange.AddIndex addIndex) {
           IndexType indexType = IndexType.valueOf(addIndex.getType().name());
@@ -815,7 +877,7 @@ public class LanceTableOperations extends ManagedTableOperations {
                   .build();
           dataset.alterColumns(List.of(lanceColumnAlter));
         } else {
-          // Currently, only column drop/rename and index addition are supported.
+          // Currently, only column add/drop/rename and index addition are supported.
           // TODO: Support change column type once we have a clear knowledge about the means of
           // castTo in Lance.
           throw new UnsupportedOperationException(
