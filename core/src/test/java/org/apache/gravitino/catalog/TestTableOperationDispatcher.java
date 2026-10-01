@@ -192,25 +192,30 @@ public class TestTableOperationDispatcher extends TestOperationDispatcher {
             .findFirst();
     Assertions.assertTrue(ident1.isPresent());
 
-    // Test when the entity store failed to put the table entity
-    doThrow(new IOException()).when(entityStore).put(any(), anyBoolean());
+    // Test when the entity store failed to put the table entity. The table is created in the
+    // underlying catalog, but Gravitino has no registration for it, so create must not report a
+    // false success.
+    doThrow(new IOException("mock store failure")).when(entityStore).put(any(), anyBoolean());
     NameIdentifier tableIdent2 = NameIdentifier.of(tableNs, "table2");
-    Table table2 =
-        tableOperationDispatcher.createTable(
-            tableIdent2, columns, "comment", props, new Transform[0]);
+    GravitinoRuntimeException exception =
+        Assertions.assertThrows(
+            GravitinoRuntimeException.class,
+            () ->
+                tableOperationDispatcher.createTable(
+                    tableIdent2, columns, "comment", props, new Transform[0]));
+    Assertions.assertEquals(IOException.class, exception.getCause().getClass());
+    Assertions.assertTrue(exception.getMessage().contains(tableIdent2.toString()));
 
-    // Check if the created Schema's field values are correct
-    Assertions.assertEquals("table2", table2.name());
-    Assertions.assertEquals("comment", table2.comment());
-    testProperties(props, table2.properties());
-
-    // Check if the Table entity is stored in the EntityStore
+    // The failed create left the table in the underlying catalog, but nothing was persisted in the
+    // entity store, so the client can observe the inconsistent state it has to clean up.
+    Optional<NameIdentifier> table2 =
+        Arrays.stream(tableOperationDispatcher.listTables(tableNs))
+            .filter(s -> s.name().equals("table2"))
+            .findFirst();
+    Assertions.assertTrue(table2.isPresent());
     Assertions.assertFalse(entityStore.exists(tableIdent2, TABLE));
     Assertions.assertThrows(
         NoSuchEntityException.class, () -> entityStore.get(tableIdent2, TABLE, TableEntity.class));
-
-    // Audit info is gotten from the catalog, not from the entity store
-    Assertions.assertEquals("test", table2.auditInfo().creator());
   }
 
   @Test
