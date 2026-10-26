@@ -666,6 +666,9 @@ public class TestIcebergCatalogPropertyConverter {
             .put("uri", "jdbc:postgresql://localhost:5432/iceberg")
             .put("jdbc-driver", "org.postgresql.Driver")
             .put("warehouse", "s3://bucket/warehouse/")
+            .put("s3-endpoint", "http://minio:9000")
+            .put("s3-region", "us-east-1")
+            .put("s3-path-style-access", "true")
             .build();
     Credential[] credentials = {
       new JdbcCredential("root", "ds123"), new S3SecretKeyCredential("AKIAEXAMPLE", "secret")
@@ -681,13 +684,28 @@ public class TestIcebergCatalogPropertyConverter {
     Assertions.assertNull(config.get("iceberg.jdbc-catalog.connection-password"));
     Assertions.assertNull(config.get("hive.s3.aws-access-key"));
     Assertions.assertNull(config.get("hive.s3.aws-secret-key"));
+    Assertions.assertNull(config.get("s3.aws-access-key"));
+    Assertions.assertNull(config.get("s3.aws-secret-key"));
     Assertions.assertEquals("true", config.get("iceberg.rest-catalog.vended-credentials-enabled"));
+    // The storage settings themselves are not credentials and still reach the REST path.
+    Assertions.assertEquals("true", config.get("fs.native-s3.enabled"));
+    Assertions.assertEquals("http://minio:9000", config.get("s3.endpoint"));
+    Assertions.assertEquals("us-east-1", config.get("s3.region"));
+    Assertions.assertEquals("true", config.get("s3.path-style-access"));
 
-    // The backend path still applies them.
+    // The backend path still applies them, under the native S3 keys Trino accepts.
     Map<String, String> legacyConfig =
         buildConnectorConfig("catalog1", properties, icebergRestUnavailableConfig(), credentials);
     Assertions.assertEquals("root", legacyConfig.get("iceberg.jdbc-catalog.connection-user"));
-    Assertions.assertEquals("AKIAEXAMPLE", legacyConfig.get("hive.s3.aws-access-key"));
+    Assertions.assertEquals("AKIAEXAMPLE", legacyConfig.get("s3.aws-access-key"));
+    Assertions.assertEquals("secret", legacyConfig.get("s3.aws-secret-key"));
+    Assertions.assertEquals("true", legacyConfig.get("fs.native-s3.enabled"));
+    Assertions.assertEquals("http://minio:9000", legacyConfig.get("s3.endpoint"));
+    Assertions.assertEquals("us-east-1", legacyConfig.get("s3.region"));
+    Assertions.assertEquals("true", legacyConfig.get("s3.path-style-access"));
+    // Trino's Iceberg connector rejects the legacy Hive keys as unused, so they must not appear.
+    Assertions.assertNull(legacyConfig.get("hive.s3.aws-access-key"));
+    Assertions.assertNull(legacyConfig.get("hive.s3.aws-secret-key"));
   }
 
   @Test

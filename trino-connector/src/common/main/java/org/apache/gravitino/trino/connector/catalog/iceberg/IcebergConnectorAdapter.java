@@ -125,7 +125,8 @@ public class IcebergConnectorAdapter implements CatalogConnectorAdapter {
 
     Map<String, String> connectorConfig =
         new HashMap<>(catalogConverter.gravitinoToEngineProperties(catalog.getProperties()));
-    IcebergCatalogPropertyConverter.applyCredentials(credentials, connectorConfig);
+    IcebergCatalogPropertyConverter.applyCredentials(
+        credentials, connectorConfig, catalog.getProperties());
     return connectorConfig;
   }
 

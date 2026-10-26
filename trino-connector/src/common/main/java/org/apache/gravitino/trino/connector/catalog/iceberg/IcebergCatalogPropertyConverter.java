@@ -72,6 +72,12 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
   private static final String TRINO_FS_NATIVE_S3_ENABLED = "fs.native-s3.enabled";
   private static final String TRINO_FS_NATIVE_GCS_ENABLED = "fs.native-gcs.enabled";
   private static final String TRINO_FS_NATIVE_AZURE_ENABLED = "fs.native-azure.enabled";
+  // Trino's Iceberg connector reads and writes table data through its native file systems. The
+  // native S3 file system binds S3FileSystemConfig without a catalog prefix, so its keys are the
+  // unprefixed `s3.*` names. The `hive.s3.*` names belong to the legacy Hive file system and are
+  // reported as unused catalog properties by the Iceberg connector.
+  private static final String TRINO_S3_ACCESS_KEY = "s3.aws-access-key";
+  private static final String TRINO_S3_SECRET_KEY = "s3.aws-secret-key";
   private static final String TRINO_S3_REGION = "s3.region";
   private static final String TRINO_S3_ENDPOINT = "s3.endpoint";
   private static final String TRINO_S3_PATH_STYLE_ACCESS = "s3.path-style-access";
@@ -88,10 +94,18 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
    * Injects credentials from credential vending into the Iceberg catalog config. Applies JDBC
    * user/password for the JDBC backend and S3 credentials for S3-backed storage.
    *
+   * <p>S3 credentials are written under Trino's native S3 file system keys ({@code s3.*}). The
+   * legacy {@code hive.s3.*} keys are not consumed by the Iceberg connector, so Trino reports them
+   * as unused and the S3 client stays unauthenticated. The native file system has to be enabled in
+   * the same step; otherwise Trino also ignores the {@code s3.*} properties.
+   *
    * @param credentials the credentials returned by the server
    * @param config the mutable Trino Iceberg connector config map to update
+   * @param catalogProperties the Gravitino catalog properties, used to derive the S3 endpoint,
+   *     region and path-style access that accompany the credentials
    */
-  public static void applyCredentials(Credential[] credentials, Map<String, String> config) {
+  public static void applyCredentials(
+      Credential[] credentials, Map<String, String> config, Map<String, String> catalogProperties) {
     for (Credential credential : credentials) {
       if (credential instanceof JdbcCredential) {
         JdbcCredential jdbc = (JdbcCredential) credential;
@@ -99,8 +113,9 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
         config.put("iceberg.jdbc-catalog.connection-password", jdbc.jdbcPassword());
       } else if (credential instanceof S3SecretKeyCredential) {
         S3SecretKeyCredential s3 = (S3SecretKeyCredential) credential;
-        config.put("hive.s3.aws-access-key", s3.accessKeyId());
-        config.put("hive.s3.aws-secret-key", s3.secretAccessKey());
+        config.put(TRINO_S3_ACCESS_KEY, s3.accessKeyId());
+        config.put(TRINO_S3_SECRET_KEY, s3.secretAccessKey());
+        applyS3StorageProperties(catalogProperties, config);
       } else if (credential instanceof AzureAccountKeyCredential) {
         AzureAccountKeyCredential azure = (AzureAccountKeyCredential) credential;
         config.put(
@@ -108,6 +123,23 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
             azure.accountKey());
       }
     }
+  }
+
+  /**
+   * Adds the native S3 file system settings that have to accompany an S3 credential. Trino only
+   * consumes {@code s3.*} properties when the native S3 file system is enabled, and an
+   * S3-compatible endpoint also needs its region and path-style setting here.
+   */
+  private static void applyS3StorageProperties(
+      Map<String, String> properties, Map<String, String> config) {
+    config.put(TRINO_FS_NATIVE_S3_ENABLED, "true");
+    copyProperty(properties, S3Properties.GRAVITINO_S3_REGION, config, TRINO_S3_REGION);
+    copyProperty(properties, S3Properties.GRAVITINO_S3_ENDPOINT, config, TRINO_S3_ENDPOINT);
+    copyProperty(
+        properties,
+        S3Properties.GRAVITINO_S3_PATH_STYLE_ACCESS,
+        config,
+        TRINO_S3_PATH_STYLE_ACCESS);
   }
 
   @Override
@@ -370,7 +402,7 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
         properties.get(CredentialConstants.CREDENTIAL_PROVIDERS));
   }
 
-  private void copyProperty(
+  private static void copyProperty(
       Map<String, String> source, String sourceKey, Map<String, String> target, String targetKey) {
     String value = source.get(sourceKey);
     if (StringUtils.isNotBlank(value)) {
