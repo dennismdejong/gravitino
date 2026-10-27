@@ -104,6 +104,12 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
    * as unused and the S3 client stays unauthenticated. The native file system has to be enabled in
    * the same step; otherwise Trino also ignores the {@code s3.*} properties.
    *
+   * <p>The S3 key is injected even when the REST catalog vends per-table credentials. Vending
+   * governs the data plane; the static key is the credential of the REST catalog's control plane,
+   * which Trino signs with it ({@code iceberg.rest-catalog.security=SIGV4}) when the catalog talks
+   * to the storage endpoint directly. Leaving it out makes Trino's {@code SigV4AwsProperties} fail
+   * to initialize and takes the whole connector down.
+   *
    * @param credentials the credentials returned by the server
    * @param config the mutable Trino Iceberg connector config map to update
    * @param catalogProperties the Gravitino catalog properties, used to derive the S3 endpoint,
@@ -117,14 +123,6 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
         config.put("iceberg.jdbc-catalog.connection-user", jdbc.jdbcUser());
         config.put("iceberg.jdbc-catalog.connection-password", jdbc.jdbcPassword());
       } else if (credential instanceof S3SecretKeyCredential) {
-        if (isVendedCredentialsEnabled(config)) {
-          // The REST catalog vends a fresh, prefix-scoped credential per table access; pinning the
-          // catalog-level snapshot as a static key would defeat that scoping.
-          LOG.debug(
-              "Skipping catalog-level S3 credential because the Iceberg REST catalog vends "
-                  + "per-table credentials");
-          continue;
-        }
         S3SecretKeyCredential s3 = (S3SecretKeyCredential) credential;
         config.put(TRINO_S3_ACCESS_KEY, s3.accessKeyId());
         config.put(TRINO_S3_SECRET_KEY, s3.secretAccessKey());
@@ -495,10 +493,5 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
     return properties.containsKey(S3Properties.GRAVITINO_S3_ENDPOINT)
         || properties.containsKey(S3Properties.GRAVITINO_S3_REGION)
         || properties.containsKey(S3Properties.GRAVITINO_S3_PATH_STYLE_ACCESS);
-  }
-
-  /** Returns whether the finished connector config uses REST access delegation. */
-  private static boolean isVendedCredentialsEnabled(Map<String, String> config) {
-    return Boolean.parseBoolean(config.get(TRINO_ICEBERG_REST_VENDED_CREDENTIALS));
   }
 }
