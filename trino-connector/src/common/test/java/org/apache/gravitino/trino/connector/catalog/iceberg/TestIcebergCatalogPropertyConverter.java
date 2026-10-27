@@ -272,6 +272,7 @@ public class TestIcebergCatalogPropertyConverter {
             .put("uri", "thrift://localhost:9083")
             .put("catalog-backend", "hive")
             .put("warehouse", "hdfs://localhost:9000/user/iceberg/warehouse")
+            .put("data-access", "vended-credentials")
             .build();
 
     Map<String, String> config =
@@ -317,6 +318,89 @@ public class TestIcebergCatalogPropertyConverter {
         "http://other-irc:9001/iceberg", config.get("iceberg.rest-catalog.uri"));
     Assertions.assertEquals("gt_iceberg_rest", config.get("iceberg.rest-catalog.warehouse"));
     Assertions.assertNull(config.get("iceberg.rest-catalog.prefix"));
+  }
+
+  @Test
+  public void testRestBackendEnablesVendedCredentialsForS3() throws Exception {
+    Map<String, String> properties =
+        ImmutableMap.<String, String>builder()
+            .put("uri", "http://gravitino-stack:9001/iceberg")
+            .put("catalog-backend", "rest")
+            // A REST catalog's warehouse is often the logical catalog name, not a storage URI.
+            .put("warehouse", "production")
+            .put("data-access", "vended-credentials")
+            .put("s3-endpoint", "http://rustfs:9000")
+            .put("s3-region", "us-east-1")
+            .put("s3-path-style-access", "true")
+            .build();
+
+    Map<String, String> config =
+        buildConnectorConfig(
+            "catalog1",
+            properties,
+            icebergRestUnavailableConfig(),
+            new Credential[] {new S3SecretKeyCredential("STATICKEY", "STATICSECRET")});
+
+    Assertions.assertEquals("rest", config.get("iceberg.catalog.type"));
+    Assertions.assertEquals("true", config.get("iceberg.rest-catalog.vended-credentials-enabled"));
+    Assertions.assertEquals("true", config.get("fs.native-s3.enabled"));
+    Assertions.assertEquals("http://rustfs:9000", config.get("s3.endpoint"));
+    Assertions.assertEquals("us-east-1", config.get("s3.region"));
+    Assertions.assertEquals("true", config.get("s3.path-style-access"));
+    // Trino must not fall back to the catalog-level static key when the REST catalog vends.
+    Assertions.assertNull(config.get("s3.aws-access-key"));
+    Assertions.assertNull(config.get("s3.aws-secret-key"));
+  }
+
+  @Test
+  public void testRestBackendKeepsStaticCredentialsWithoutDataAccess() throws Exception {
+    Map<String, String> properties =
+        ImmutableMap.<String, String>builder()
+            .put("uri", "http://rustfs:8181")
+            .put("catalog-backend", "rest")
+            .put("warehouse", "s3://bucket/warehouse/")
+            .put("s3-endpoint", "http://rustfs:9000")
+            .put("s3-region", "us-east-1")
+            .put("s3-path-style-access", "true")
+            .build();
+
+    Map<String, String> config =
+        buildConnectorConfig(
+            "catalog1",
+            properties,
+            icebergRestUnavailableConfig(),
+            new Credential[] {new S3SecretKeyCredential("STATICKEY", "STATICSECRET")});
+
+    Assertions.assertNull(config.get("iceberg.rest-catalog.vended-credentials-enabled"));
+    Assertions.assertEquals("STATICKEY", config.get("s3.aws-access-key"));
+    Assertions.assertEquals("STATICSECRET", config.get("s3.aws-secret-key"));
+    Assertions.assertEquals("true", config.get("fs.native-s3.enabled"));
+  }
+
+  @Test
+  public void testIcebergRestRouteEnablesVendedCredentialsForLogicalWarehouse() throws Exception {
+    Map<String, String> properties =
+        ImmutableMap.<String, String>builder()
+            .put("catalog-backend", "jdbc")
+            .put("uri", "jdbc:postgresql://localhost:5432/iceberg")
+            .put("jdbc-driver", "org.postgresql.Driver")
+            .put("warehouse", "catalog1")
+            .put("data-access", "vended-credentials")
+            .put("s3-endpoint", "http://rustfs:9000")
+            .put("s3-region", "us-east-1")
+            .put("s3-path-style-access", "true")
+            .build();
+
+    Map<String, String> config =
+        buildConnectorConfig(
+            "catalog1", properties, icebergRestConfiguredConfig(ImmutableMap.of()));
+
+    Assertions.assertEquals("rest", config.get("iceberg.catalog.type"));
+    Assertions.assertEquals("true", config.get("iceberg.rest-catalog.vended-credentials-enabled"));
+    Assertions.assertEquals("true", config.get("fs.native-s3.enabled"));
+    Assertions.assertEquals("http://rustfs:9000", config.get("s3.endpoint"));
+    Assertions.assertEquals("us-east-1", config.get("s3.region"));
+    Assertions.assertEquals("true", config.get("s3.path-style-access"));
   }
 
   @Test

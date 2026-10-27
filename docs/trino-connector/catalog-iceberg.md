@@ -85,6 +85,41 @@ credentials are only consumed by Trino's native file systems:
 A scheme in the last row has no Trino native file system, so a catalog that vends credentials for it
 cannot have them applied; the connector logs a warning when it detects that combination.
 
+### Vended credentials from a REST catalog
+
+A `lakehouse-iceberg` catalog with a REST backend can delegate data-plane credentials to Trino.
+Set `data-access=vended-credentials` on the Gravitino catalog; the connector then:
+
+- sets `iceberg.rest-catalog.vended-credentials-enabled=true`, so Trino sends
+  `X-Iceberg-Access-Delegation: vended-credentials` with its REST requests and uses the
+  `storage-credentials` returned by `LoadTable`;
+- enables the native S3 file system and copies `s3.endpoint`, `s3.region` and
+  `s3.path-style-access` from the catalog's `s3-endpoint`, `s3-region` and
+  `s3-path-style-access`, so the vended credentials can be applied to `s3://` table locations.
+
+`warehouse` may be the logical Gravitino catalog name rather than a storage URI; in that case the
+catalog's S3 settings are what identify the storage. When vending is enabled, the connector does not
+inject catalog-level static S3 credentials, so Trino uses only the temporary, prefix-scoped
+credentials vended for each table. This also covers REST catalogs such as RustFS S3 Tables, which
+have no STS and therefore cannot use the `s3-token` provider.
+
+```json
+{
+  "catalog-backend": "rest",
+  "uri": "http://rustfs:8181",
+  "warehouse": "production",
+  "data-access": "vended-credentials",
+  "s3-endpoint": "http://rustfs:9000",
+  "s3-region": "us-east-1",
+  "s3-path-style-access": "true"
+}
+```
+
+The per-table credential plumbing is available in Trino 482 and later. Trino's S3 client refreshes
+vended credentials only when the REST catalog supplies a refresh endpoint and an
+`s3.session-token-expires-at-ms` expiry; a catalog that reports only its own expiry field keeps the
+credentials for the duration of the query.
+
 On the Gravitino side, the IRC must run with the dynamic config provider so it can serve catalogs
 defined in Gravitino:
 

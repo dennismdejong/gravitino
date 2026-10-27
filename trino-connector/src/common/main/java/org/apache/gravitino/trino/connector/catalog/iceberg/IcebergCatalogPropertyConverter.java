@@ -82,6 +82,11 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
   private static final String TRINO_S3_ENDPOINT = "s3.endpoint";
   private static final String TRINO_S3_PATH_STYLE_ACCESS = "s3.path-style-access";
 
+  /**
+   * Gravitino catalog data-access mode that asks the Iceberg REST catalog for storage credentials.
+   */
+  private static final String DATA_ACCESS_VENDED_CREDENTIALS = "vended-credentials";
+
   /** Routing keys the connector always derives itself; they cannot be overridden. */
   private static final List<String> RESERVED_REST_PROPERTIES =
       List.of(
@@ -112,6 +117,14 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
         config.put("iceberg.jdbc-catalog.connection-user", jdbc.jdbcUser());
         config.put("iceberg.jdbc-catalog.connection-password", jdbc.jdbcPassword());
       } else if (credential instanceof S3SecretKeyCredential) {
+        if (isVendedCredentialsEnabled(config)) {
+          // The REST catalog vends a fresh, prefix-scoped credential per table access; pinning the
+          // catalog-level snapshot as a static key would defeat that scoping.
+          LOG.debug(
+              "Skipping catalog-level S3 credential because the Iceberg REST catalog vends "
+                  + "per-table credentials");
+          continue;
+        }
         S3SecretKeyCredential s3 = (S3SecretKeyCredential) credential;
         config.put(TRINO_S3_ACCESS_KEY, s3.accessKeyId());
         config.put(TRINO_S3_SECRET_KEY, s3.secretAccessKey());
@@ -208,6 +221,14 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
     // Later put/putAll calls override earlier ones for the same key; this is call-order
     // precedence, unrelated to HashMap's (unspecified) iteration order.
     Map<String, String> storageProperties = buildStorageProperties(catalog.getProperties());
+    // A REST catalog's `warehouse` can be a logical catalog name rather than a storage location, so
+    // the catalog's S3 settings are the only signal that its tables live on S3. Without the native
+    // S3 file system Trino cannot apply the vended credentials to a table location.
+    if (isVendedCredentialsRequested(catalog.getProperties())
+        && isS3Storage(catalog.getProperties())
+        && !Boolean.parseBoolean(storageProperties.get(TRINO_FS_NATIVE_S3_ENABLED))) {
+      applyS3StorageProperties(catalog.getProperties(), storageProperties);
+    }
     config.putAll(storageProperties);
     // Trino 482 dropped the fallback to the Hadoop file system when no vended credential is
     // actually present for a table (older versions used it whenever none of the per-scheme
@@ -426,6 +447,58 @@ public class IcebergCatalogPropertyConverter extends CatalogPropertyConverter {
       restProperties.put(
           "iceberg.rest-catalog.warehouse", properties.get(IcebergConstants.WAREHOUSE));
     }
+    // A REST catalog that opts into vended credentials returns prefix-scoped, temporary storage
+    // credentials in its LoadTable response. Trino only asks for them when this flag is on; a
+    // native file system must be enabled as well, otherwise Trino has no implementation that can
+    // consume the credentials for the table's storage scheme.
+    if (isVendedCredentialsRequested(properties)) {
+      Map<String, String> storageProperties = buildStorageProperties(properties);
+      boolean nativeFileSystem =
+          Boolean.parseBoolean(storageProperties.get(TRINO_FS_NATIVE_S3_ENABLED))
+              || Boolean.parseBoolean(storageProperties.get(TRINO_FS_NATIVE_GCS_ENABLED))
+              || Boolean.parseBoolean(storageProperties.get(TRINO_FS_NATIVE_AZURE_ENABLED));
+      if (!nativeFileSystem && isS3Storage(properties)) {
+        applyS3StorageProperties(properties, storageProperties);
+        nativeFileSystem = true;
+      }
+      restProperties.putAll(storageProperties);
+      restProperties.put(TRINO_ICEBERG_REST_VENDED_CREDENTIALS, String.valueOf(nativeFileSystem));
+    }
     return restProperties;
+  }
+
+  /**
+   * Returns whether the catalog asks the Iceberg REST catalog to vend per-table storage
+   * credentials, which Trino enables through {@code
+   * iceberg.rest-catalog.vended-credentials-enabled} and then consumes from each {@code LoadTable}
+   * response.
+   */
+  private static boolean isVendedCredentialsRequested(Map<String, String> properties) {
+    return DATA_ACCESS_VENDED_CREDENTIALS.equalsIgnoreCase(
+        properties.get(IcebergConstants.DATA_ACCESS));
+  }
+
+  /** Returns whether the catalog configures S3-backed storage. */
+  private static boolean isS3Storage(Map<String, String> properties) {
+    String warehouse = properties.get(IcebergConstants.WAREHOUSE);
+    if (StringUtils.isNotBlank(warehouse)) {
+      String scheme = StringUtils.substringBefore(warehouse, "://").toLowerCase(Locale.ROOT);
+      if ("s3".equals(scheme) || "s3a".equals(scheme) || "s3n".equals(scheme)) {
+        return true;
+      }
+    }
+    String ioImpl = properties.get(IcebergConstants.IO_IMPL);
+    if (ioImpl != null
+        && StringUtils.containsIgnoreCase(ioImpl, "org.apache.iceberg.aws.s3.S3FileIO")) {
+      return true;
+    }
+    return properties.containsKey(S3Properties.GRAVITINO_S3_ENDPOINT)
+        || properties.containsKey(S3Properties.GRAVITINO_S3_REGION)
+        || properties.containsKey(S3Properties.GRAVITINO_S3_PATH_STYLE_ACCESS);
+  }
+
+  /** Returns whether the finished connector config uses REST access delegation. */
+  private static boolean isVendedCredentialsEnabled(Map<String, String> config) {
+    return Boolean.parseBoolean(config.get(TRINO_ICEBERG_REST_VENDED_CREDENTIALS));
   }
 }
